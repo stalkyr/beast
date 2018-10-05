@@ -202,6 +202,7 @@ class basic_parser
     static unsigned constexpr flagChunked               = 1<< 11;
     static unsigned constexpr flagUpgrade               = 1<< 12;
     static unsigned constexpr flagFinalChunk            = 1<< 13;
+    static unsigned constexpr flagMultipart             = 1<< 14;
 
     static constexpr
     std::uint64_t
@@ -229,6 +230,7 @@ class basic_parser
     unsigned short status_ = 0;             // response status
     state state_ = state::nothing_yet;      // initial state
     unsigned f_ = 0;                        // flags
+    std::string boundary_;
 
 protected:
     /// Default constructor
@@ -606,6 +608,16 @@ private:
     void
     parse_chunk_body(char const*& p,
         std::size_t n, error_code& ec);
+
+    void
+    find_multipart_boundary(
+        char const*& p, char const* last,
+            error_code& ec);
+
+    void
+    parse_multipart_fields(
+        char const*& p, char const* last,
+            error_code& ec);
 
     void
     do_field(field f,

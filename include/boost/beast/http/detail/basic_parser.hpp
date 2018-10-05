@@ -47,6 +47,9 @@ struct basic_parser_base
         chunk_header0,
         chunk_header,
         chunk_body,
+        multipart_boundary,
+        multipart_fields,
+        multipart_body,
         complete
     };
 

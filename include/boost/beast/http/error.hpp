@@ -144,7 +144,10 @@ enum class error
     bad_chunk_extension,
 
     /// An obs-fold exceeded an internal limit.
-    bad_obs_fold
+    bad_obs_fold,
+
+    /// The multipart syntax is invalid.
+    bad_multipart
 };
 
 } // http

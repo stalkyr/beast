@@ -254,6 +254,88 @@ loop:
             goto done;
         break;
 
+    case state::multipart_boundary:
+        BOOST_ASSERT(!skip_);
+        find_multipart_boundary(p, p1, ec);
+        if (ec)
+            goto done;
+
+        p += boundary_.size() + 2;
+
+        if (state_ == state::complete) {
+            goto done;
+        }
+
+        impl().on_multipart_boundary_impl(ec);
+        if (ec) {
+            goto done;
+        }
+
+        n = static_cast<std::size_t>(p1 - p);
+        state_ = state::multipart_fields;
+        BOOST_FALLTHROUGH;
+
+    case state::multipart_fields:
+        maybe_need_more(p, n, ec);
+        if (ec)
+            goto done;
+        parse_multipart_fields(p, p1, ec);
+        if (ec) {
+            if (ec == error::need_more) {
+                if (n >= header_limit_) {
+                    ec = error::header_limit;
+                    goto done;
+                }
+                if (p + 3 <= p1)
+                    skip_ = static_cast<std::size_t>(p1 - p - 3);
+            }
+            goto done;
+        }
+
+        n = static_cast<std::size_t>(p1 - p);
+        state_ = state::multipart_body;
+        BOOST_FALLTHROUGH;
+
+    case state::multipart_body:
+        if (len_) {
+            BOOST_ASSERT(!skip_);
+            if (n < len_) {
+                ec = error::need_more;
+                goto done;
+            }
+
+            impl().on_multipart_body_impl({p, len_}, ec);
+            p += len_;
+            if (ec)
+                goto done;
+
+            state_ = state::multipart_boundary;
+        }
+        else {
+            auto p00 = p;
+            p += skip_;
+            find_multipart_boundary(p, p1, ec);
+            if (ec) {
+                skip_ = static_cast<std::size_t>(p - p00);
+                p = p00;
+                goto done;
+            }
+            skip_ = 0;
+
+            impl().on_multipart_body_impl({p00, static_cast<std::size_t>(p - p00)}, ec);
+            p += boundary_.size() + 2;
+            if (ec || state_ == state::complete)
+                goto done;
+
+            impl().on_multipart_boundary_impl(ec);
+            if (ec) {
+                goto done;
+            }
+
+            state_ = state::multipart_fields;
+        }
+        break;
+
     case state::complete:
         ec.assign(0, ec.category());
         goto done;
@@ -593,6 +675,10 @@ finish_header(error_code& ec, std::false_type)
         f_ |= flagHasBody;
         state_ = state::chunk_header0;
     }
+    else if (f_ & flagMultipart) {
+        f_ |= flagHasBody;
+        state_ = state::multipart_boundary;
+    }
     else
     {
         f_ |= flagHasBody;
@@ -805,6 +891,87 @@ parse_chunk_body(char const*& p,
 }
 
 template<bool isRequest, class Derived>
+inline
+void
+basic_parser<isRequest, Derived>::
+find_multipart_boundary(
+    char const*& p, char const* last,
+        error_code& ec)
+{
+    for (;;) {
+        auto const pos = string_view{p, static_cast<std::size_t>(last - p)}.find(boundary_);
+        if (pos == string_view::npos) {
+            ec = error::need_more;
+            break;
+        }
+
+        p += pos;
+        auto const p1 = p + boundary_.size();
+        if (p1 + 2 > last) {
+            ec = error::need_more;
+            break;
+        }
+
+        if (p1[0] == '-' && p1[1] == '-') {
+            state_ = state::complete;
+            break;
+        }
+        if (p1[0] == '\r' && p1[1] == '\n') {
+            break;
+        }
+
+        ++p;
+    }
+}
+
+template <bool isRequest, class Derived>
+void
+basic_parser<isRequest, Derived>::
+parse_multipart_fields(char const*& in,
+    char const* last, error_code& ec)
+{
+    len_ = 0;
+
+    string_view name;
+    string_view value;
+    // https://stackoverflow.com/questions/686217/maximum-on-http-header-values
+    static_string<max_obs_fold> buf;
+    auto p = in;
+    for (;;) {
+        if (p + 2 > last) {
+            ec = error::need_more;
+            return;
+        }
+        if (p[0] == '\r') {
+            if (p[1] != '\n')
+                ec = error::bad_line_ending;
+            in = p + 2;
+            return;
+        }
+
+        parse_field(p, last, name, value, buf, ec);
+        if (ec) return;
+
+        auto const f = string_to_field(name);
+
+        if (f == field::content_length) {
+            std::uint64_t v;
+            if (!parse_dec(value.begin(), value.end(), v)) {
+                ec = error::bad_content_length;
+                return;
+            }
+
+            len_ = v;
+        }
+
+        impl().on_multipart_field_impl(f, name, value, ec);
+        if (ec) return;
+
+        in = p;
+    }
+}
+
+template<bool isRequest, class Derived>
 void
 basic_parser<isRequest, Derived>::
 do_field(field f,
@@ -906,6 +1073,40 @@ do_field(field f,
             return;
         len_ = 0;
         f_ |= flagChunked;
+        return;
+    }
+
+    // Content-Type
+    if (f == field::content_type) {
+        if (value.starts_with("multipart/")) {
+            if (f_ & flagMultipart) {
+                // duplicate
+                ec = error::bad_multipart;
+                return;
+            }
+
+            if (f_ & flagContentLength) {
+                // conflicting field
+                ec = error::bad_multipart;
+                return;
+            }
+
+            auto sz = value.find(';');
+            if (sz != value.npos) {
+                param_list list(value.substr(sz));
+                for (const auto& v : list) {
+                    if (iequals({"boundary", 8}, v.first) && !v.second.empty()) {
+                        boundary_ = "--";
+                        boundary_.append(v.second.data(), v.second.size());
+                        f_ |= flagMultipart;
+                        return;
+                    }
+                }
+            }
+
+            // no boundary
+            ec = error::bad_multipart;
+        }
         return;
     }
 
